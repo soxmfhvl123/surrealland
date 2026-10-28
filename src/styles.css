@@ -3224,3 +3224,20 @@ button.drop-box:hover {
 .timeline {
   gap: 6px 8px;
 }
+
+/* rectangle / ellipse selection while dragging */
+.marquee {
+  position: absolute;
+  border: 1px dashed #fff;
+  outline: 1px dashed rgba(0, 0, 0, 0.6);
+  outline-offset: -2px;
+  background: rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+.marquee.ellipse {
+  border-radius: 50% !important;
+  outline: none;
+}
+.marquee.sub {
+  border-color: #ff8a95;
+}

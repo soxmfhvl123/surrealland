@@ -35,6 +35,8 @@ interface Props {
   onRectChange: (key: string, r: Rect) => void;
   onCrop: (c: Crop) => void;
   onPick: (x: number, y: number, mods: PickMods) => void;
+  /** a rectangle or ellipse dragged out in the select tool (normalized frame coords) */
+  onMarquee: (r: Rect, shape: 'rect' | 'ellipse', mods: PickMods) => void;
   /** a finished brush stroke on the layer's own painted mask */
   onLayerPaint: (url: string) => void;
   /** brush on the active selection; creates one first if there is none */
@@ -142,7 +144,9 @@ export function Stage(p: Props) {
   const selBrush = selecting && selectMode === 'brush';
   const layerBrush = !selecting && !!layer && layer.mask?.shape === 'paint';
   const brushing = selBrush || layerBrush;
-  const picking = selecting && selectMode !== 'brush';
+  const marqueeMode = selecting && (selectMode === 'rect' || selectMode === 'ellipse');
+  const picking = selecting && (selectMode === 'click' || selectMode === 'color');
+  const [marquee, setMarquee] = useState<Rect | null>(null);
   const erase = brush.erase !== alt;
 
   useEffect(() => onMasksChanged(() => setMaskTick((n) => n + 1)), []);
@@ -358,8 +362,42 @@ export function Stage(p: Props) {
     window.addEventListener('pointerup', up);
   };
 
+  // drag out a box; on release it becomes (or edits) a selection
+  const startMarquee = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const a = toNorm(e);
+    const mods = { add: e.shiftKey, subtract: e.altKey };
+    const shape = selectMode === 'ellipse' ? 'ellipse' : 'rect';
+    const pointer = e.pointerId;
+    let r: Rect = { x: clamp01(a.x), y: clamp01(a.y), w: 0, h: 0 };
+    setMarquee(r);
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      const b = toNorm(ev);
+      const x0 = clamp01(Math.min(a.x, b.x));
+      const y0 = clamp01(Math.min(a.y, b.y));
+      r = { x: x0, y: y0, w: clamp01(Math.max(a.x, b.x)) - x0, h: clamp01(Math.max(a.y, b.y)) - y0 };
+      setMarquee(r);
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      setMarquee(null);
+      if (r.w > 0.01 && r.h > 0.01) p.onMarquee(round(r), shape, mods);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0 || !hasPhoto || compare) return;
+    if (marqueeMode) {
+      if (!p.busy) startMarquee(e);
+      return;
+    }
     if (picking) {
       e.preventDefault();
       if (p.busy) return;
@@ -371,7 +409,7 @@ export function Stage(p: Props) {
     if (tool === 'photo') startPan(e);
   };
 
-  const frameClass = ['frame', brushing ? 'brushing' : '', picking ? (alt ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : ''].join(' ');
+  const frameClass = ['frame', brushing ? 'brushing' : '', picking || marqueeMode ? (alt ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : ''].join(' ');
 
   const hint = p.busy
     ? null
@@ -380,7 +418,9 @@ export function Stage(p: Props) {
         ? alt
           ? '지우는 중 — Option을 떼면 칠하기'
           : '드래그해서 칠하기 · Option 누르고 드래그하면 지우기'
-        : selectMode === 'color'
+        : marqueeMode
+          ? `드래그해서 ${selectMode === 'ellipse' ? '원' : '네모'}로 선택 · Shift+드래그 더하기 · Option+드래그 빼기`
+          : selectMode === 'color'
           ? '클릭한 색과 비슷한 곳을 선택 · Shift 더하기 · Option 빼기'
           : alt
             ? '클릭한 물체를 지금 선택에서 빼요'
@@ -415,6 +455,12 @@ export function Stage(p: Props) {
           <div
             className={`brush-cursor ${erase ? 'erase' : ''}`}
             style={{ left: `${cursor.x * 100}%`, top: `${cursor.y * 100}%`, width: `${brush.size * 2}%` }}
+          />
+        )}
+        {marquee && (
+          <div
+            className={`marquee ${selectMode === 'ellipse' ? 'ellipse' : ''} ${alt ? 'sub' : ''}`}
+            style={{ left: `${marquee.x * 100}%`, top: `${marquee.y * 100}%`, width: `${marquee.w * 100}%`, height: `${marquee.h * 100}%` }}
           />
         )}
         {!hasPhoto && (

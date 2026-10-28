@@ -2,7 +2,7 @@ import { Brush, Cloud, MousePointerClick, Moon, Pipette, Plus, Scissors, Sparkle
 import type { Layer, Selection } from '../engine/types';
 import { PanelHeader, Seg, Slider, Toggle } from './kit';
 
-export type SelectMode = 'click' | 'brush' | 'color';
+export type SelectMode = 'click' | 'brush' | 'rect' | 'ellipse' | 'color';
 export type QuickSelect = 'sky' | 'person' | 'bright' | 'dark' | 'empty';
 
 interface Props {
@@ -28,6 +28,8 @@ interface Props {
 const HINT: Record<SelectMode, string> = {
   click: '사진에서 물체를 클릭하세요. Shift+클릭은 지금 선택에 더하기, Option(Alt)+클릭은 빼기예요.',
   brush: '드래그해서 지금 선택을 칠해요. Option(Alt)을 누르고 드래그하면 지워져요.',
+  rect: '드래그해서 네모로 선택해요. Shift+드래그는 지금 선택에 더하기, Option(Alt)+드래그는 빼기예요.',
+  ellipse: '드래그해서 원(타원)으로 선택해요. Shift+드래그는 더하기, Option(Alt)+드래그는 빼기예요.',
   color: '사진에서 색을 클릭하면 비슷한 색이 모두 선택돼요. Shift+클릭은 더하기.',
 };
 
@@ -51,6 +53,8 @@ export function SelectPanel(p: Props) {
           options={[
             { value: 'click', label: <><MousePointerClick size={14} /> 클릭</> },
             { value: 'brush', label: <><Brush size={14} /> 브러시</> },
+            { value: 'rect', label: '네모' },
+            { value: 'ellipse', label: '원' },
             { value: 'color', label: <><Pipette size={14} /> 색</> },
           ]}
         />

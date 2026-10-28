@@ -404,6 +404,27 @@ export default function App() {
     patchSel(sel.id, { paint: encode(out) });
   };
 
+  /** A dragged box (or ellipse) becomes a new selection, or is added to / cut from the active one. */
+  const onMarquee = async (r: Rect, shape: 'rect' | 'ellipse', mods: PickMods) => {
+    const { w, h } = maskSize(fmt);
+    const mask = blankMask(w, h);
+    const ctx = mask.getContext('2d')!;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    if (shape === 'ellipse') ctx.ellipse((r.x + r.w / 2) * w, (r.y + r.h / 2) * h, (r.w / 2) * w, (r.h / 2) * h, 0, 0, Math.PI * 2);
+    else ctx.rect(r.x * w, r.y * h, r.w * w, r.h * h);
+    ctx.fill();
+    const editing = mods.add || mods.subtract ? activeSel : null;
+    if (mods.subtract && !editing) return setToast('뺄 선택이 없어요. 먼저 선택을 하나 만드세요');
+    if (editing) {
+      await modifySel(editing, mask, mods.subtract ? 'subtract' : 'add');
+      setToast(mods.subtract ? `“${editing.name}”에서 뺐어요` : `“${editing.name}”에 더했어요`);
+    } else {
+      const sel = addSelection(uniqueName(project.selections, shape === 'ellipse' ? '원' : '네모', true), mask);
+      setToast(`“${sel.name}” 선택됨 — 아래 버튼으로 효과를 넣거나 오려 띄워보세요`);
+    }
+  };
+
   const onPick = async (x: number, y: number, mods: PickMods) => {
     const base = baseFrame(project);
     if (!base) return;
@@ -825,6 +846,7 @@ export default function App() {
           onRectChange={setRect}
           onCrop={(crop) => update((p) => ({ ...p, crop }))}
           onPick={(x, y, mods) => void onPick(x, y, mods)}
+          onMarquee={(r, shape, mods) => void onMarquee(r, shape, mods)}
           onLayerPaint={(url) => layer && patchLayer(layer.id, { mask: { ...layer.mask!, paint: url } })}
           onSelectionPaint={(id, url) => patchSel(id, { paint: url })}
           onNewBlankSelection={(url) => {
