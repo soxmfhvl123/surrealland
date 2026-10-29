@@ -1,4 +1,5 @@
-import { Brush, Cloud, MousePointerClick, Moon, Pipette, Plus, Scissors, Sparkles, Sun, Trash, User, Waves } from 'lucide-react';
+import { Brush, Cloud, Download, MousePointerClick, Moon, Pipette, Plus, Scissors, Sparkles, Sun, Trash, User, Wand2, Waves } from 'lucide-react';
+import type { SplitDetail } from '../engine/autoSplit';
 import type { Layer, Selection } from '../engine/types';
 import { PanelHeader, Seg, Slider, Toggle } from './kit';
 
@@ -23,6 +24,12 @@ interface Props {
   onCutout: (id: string) => void;
   onFlow: (id: string) => void;
   onDelete: (id: string) => void;
+  splitDetail: SplitDetail;
+  splitLayers: boolean;
+  onSplitDetail: (d: SplitDetail) => void;
+  onSplitLayers: (v: boolean) => void;
+  onAutoSplit: () => void;
+  onExportPsd: () => void;
 }
 
 const HINT: Record<SelectMode, string> = {
@@ -63,6 +70,28 @@ export function SelectPanel(p: Props) {
         <p className="hint">{HINT[p.mode]}</p>
         {p.mode === 'color' && <Slider label="색 허용 범위" value={p.colorTol} min={0} max={1} step={0.01} format={(v) => `${Math.round(v * 100)}%`} onChange={p.onColorTol} />}
         {p.busy && <p className="hint warn-text">{p.busy}</p>}
+      </div>
+
+      <div className="block">
+        <div className="block-title">자동 누끼</div>
+        <p className="hint">버튼 한 번이면 사진 속 물체를 전부 찾아 조각조각 누끼를 따요. 조각은 선택으로 저장되고, 켜두면 조각마다 레이어가 생겨 캔버스에서 끌어 옮길 수 있어요.</p>
+        <Seg
+          value={p.splitDetail}
+          onChange={p.onSplitDetail}
+          options={[
+            { value: 'low', label: '크게' },
+            { value: 'mid', label: '보통' },
+            { value: 'high', label: '잘게' },
+          ]}
+        />
+        <Toggle label="조각마다 레이어로도 나누기" checked={p.splitLayers} onChange={p.onSplitLayers} />
+        <button className="primary wide" onClick={p.onAutoSplit} disabled={!p.hasPhoto || !!p.busy}>
+          <Wand2 size={15} /> {p.selections.some((s) => s.group) ? '다시 자동 누끼 따기' : '자동 누끼 따기'}
+        </button>
+        {p.selections.some((s) => s.group) && <p className="hint">다시 따면 지난 자동 누끼 조각과 그 레이어가 새 결과로 바뀌어요. ⌘Z로 되돌릴 수 있어요.</p>}
+        <button className="ghost wide" onClick={p.onExportPsd} disabled={!p.hasPhoto || !p.selections.length || !!p.busy}>
+          <Download size={15} /> 레이어 PSD로 받기
+        </button>
       </div>
 
       <div className="block">

@@ -48,6 +48,10 @@ interface Props {
   onPick: (x: number, y: number, mods: PickMods) => void;
   /** a box, ellipse or lasso drawn in the select tool */
   onMarquee: (shape: MarqueeShape, mods: PickMods) => void;
+  /** a cut-out piece was grabbed on the canvas (effects tool) */
+  onLayerPick: (id: string) => void;
+  /** a grabbed piece was dragged; `drag` is the same for every move of one drag */
+  onLayerMove: (id: string, dx: number, dy: number, drag: number) => void;
   /** a finished brush stroke on the layer's own painted mask */
   onLayerPaint: (url: string) => void;
   /** brush on the active selection; creates one first if there is none */
@@ -172,6 +176,8 @@ export function Stage(p: Props) {
   const marqueeMode = selecting && (selectMode === 'rect' || selectMode === 'ellipse');
   const lassoMode = selecting && selectMode === 'lasso';
   const picking = selecting && (selectMode === 'click' || selectMode === 'color');
+  // cut-out layers (e.g. from 자동 누끼) can be grabbed and dragged in the effects tool
+  const pieces = tool === 'effects' && hasPhoto && !layerBrush ? project.layers.filter((l) => l.enabled && l.type === 'cutout' && l.params.selection) : [];
   const [marquee, setMarquee] = useState<Rect | null>(null);
   const [lasso, setLasso] = useState<{ pts: LassoPt[]; mods: PickMods } | null>(null);
   const lassoRef = useRef(lasso);
@@ -266,7 +272,8 @@ export function Stage(p: Props) {
         const src = selectionMaskAt(s, project, time)?.canvas;
         if (!src) continue;
         const active = s.id === activeSel?.id;
-        drawTinted(ctx, src, s.color, active ? 0.42 : 0, active ? 1 : 0.55, tmp);
+        // auto-split pieces stay lightly tinted, so the split reads as a colour map
+        drawTinted(ctx, src, s.color, active ? 0.42 : s.group ? 0.2 : 0, active ? 1 : 0.55, tmp);
       }
     }
     if (p.peekSel && tool !== 'select') {
@@ -503,6 +510,44 @@ export function Stage(p: Props) {
     window.addEventListener('pointercancel', up);
   };
 
+  /** The topmost cut-out piece under a point, sampling its mask where the piece now sits. */
+  const pieceAt = (q: Pt): Layer | null => {
+    for (let i = pieces.length - 1; i >= 0; i--) {
+      const l = pieces[i];
+      const sel = project.selections.find((s) => s.id === l.params.selection);
+      const m = sel && selectionMaskAt(sel, project, time)?.canvas;
+      if (!m) continue;
+      const x = Math.floor((q.x - Number(l.params.dx) / 100) * m.width);
+      const y = Math.floor((q.y - Number(l.params.dy) / 100) * m.height);
+      if (x < 0 || y < 0 || x >= m.width || y >= m.height) continue;
+      if (m.getContext('2d')!.getImageData(x, y, 1, 1).data[3] > 100) return l;
+    }
+    return null;
+  };
+
+  const startMove = (e: React.PointerEvent, l: Layer) => {
+    e.preventDefault();
+    const f = frameRef.current!.getBoundingClientRect();
+    const { clientX: px, clientY: py, pointerId: pointer } = e;
+    const dx0 = Number(l.params.dx);
+    const dy0 = Number(l.params.dy);
+    const drag = Date.now();
+    const to1 = (v: number) => Math.round(Math.min(100, Math.max(-100, v)) * 10) / 10;
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      p.onLayerMove(l.id, to1(dx0 + ((ev.clientX - px) / f.width) * 100), to1(dy0 + ((ev.clientY - py) / f.height) * 100), drag);
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0 || !hasPhoto || compare) return;
     if (marqueeMode) {
@@ -521,10 +566,17 @@ export function Stage(p: Props) {
       return;
     }
     if (brushing) return startPaint(e);
+    if (pieces.length) {
+      const hit = pieceAt(toNorm(e));
+      if (hit) {
+        p.onLayerPick(hit.id);
+        return startMove(e, hit);
+      }
+    }
     if (tool === 'photo') startPan(e);
   };
 
-  const frameClass = ['frame', brushing ? 'brushing' : '', picking || marqueeMode || lassoMode ? ((lasso ? lasso.mods.subtract : alt) ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : ''].join(' ');
+  const frameClass = ['frame', brushing ? 'brushing' : '', picking || marqueeMode || lassoMode ? ((lasso ? lasso.mods.subtract : alt) ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : '', pieces.length ? 'moving' : ''].join(' ');
 
   const hint = p.busy
     ? null
@@ -546,7 +598,9 @@ export function Stage(p: Props) {
             : '물체를 클릭하세요 · Shift+클릭 더하기 · Option+클릭 빼기'
       : layerBrush
         ? '드래그해서 효과가 들어갈 곳을 칠하기 · Option 누르고 드래그하면 지우기'
-        : null;
+        : pieces.length
+          ? '조각을 끌어서 옮기기 · 크기·회전·그림자는 오른쪽에서'
+          : null;
 
   return (
     <div className="stage">

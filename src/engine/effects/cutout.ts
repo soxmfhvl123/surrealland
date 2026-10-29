@@ -76,6 +76,9 @@ export const cutout: EffectDef = {
   render(rc, p) {
     const id = str(p, 'selection');
     if (!id) return;
+    // a piece still sitting exactly where it was cut (fresh from 자동 누끼) changes nothing
+    const still = !num(p, 'dx') && !num(p, 'dy') && num(p, 'scale') === 100 && !num(p, 'rotate') && !num(p, 'float') && !num(p, 'spin');
+    if (still && str(p, 'source') !== 'base' && str(p, 'hole') === 'keep' && !num(p, 'shadow') && !num(p, 'outline') && num(p, 'copies') <= 1) return;
     const mask = rc.selection(id);
     if (!mask) return;
     const { ctx, w, h, s, t } = rc;

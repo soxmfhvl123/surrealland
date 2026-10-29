@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { CircleQuestionMark, FolderOpen, Redo2, Save, Shuffle, Undo2 } from 'lucide-react';
-import { defaultParams, EFFECT_MAP, selectionParam } from './engine/effects';
+import { autoSplit, type SplitDetail } from './engine/autoSplit';
+import { defaultParams, EFFECT_MAP, makeLayer, selectionParam } from './engine/effects';
 import { LOOK_MAP } from './engine/looks';
 import {
   blankMask,
@@ -20,6 +21,7 @@ import {
   type MaskOp,
 } from './engine/masks';
 import { randomStack, RECIPES, type Recipe } from './engine/presets';
+import { exportLayersPsd } from './engine/psd';
 import { uid } from './engine/random';
 import { getFormat } from './engine/renderer';
 import { getTrack, onTracksChanged, setTrack } from './engine/track';
@@ -99,6 +101,8 @@ export default function App() {
   const [aiRequest, setAiRequest] = useState<PromptRequest | null>(null);
   const [brush, setBrush] = useState<BrushState>({ size: 5, softness: 0.5, erase: false });
   const [selectMode, setSelectMode] = useState<SelectMode>('click');
+  const [splitDetail, setSplitDetail] = useState<SplitDetail>('mid');
+  const [splitLayers, setSplitLayers] = useState(true);
   const [colorTol, setColorTol] = useState(0.3);
   const [showSelections, setShowSelections] = useState(true);
   const [peekSel, setPeekSel] = useState<string | null>(null);
@@ -488,6 +492,60 @@ export default function App() {
     }
   };
 
+  /** 자동 누끼: cut the whole photo into pieces, each a selection (and, if asked, a movable layer). */
+  const runAutoSplit = async () => {
+    const base = baseFrame(project);
+    if (!base) return;
+    setBusy('자동 누끼 준비 중… 처음엔 모델을 받느라 몇 초 걸려요');
+    try {
+      const pieces = await autoSplit(base, splitDetail, (done, total) => setBusy(`자동 누끼 따는 중… ${Math.round((done / total) * 100)}%`));
+      if (!pieces.length) return setToast('나눌 물체를 찾지 못했어요');
+      // the last run's pieces and the layers made from them give way, unless another effect uses a piece
+      const old = new Set(project.selections.filter((s) => s.group).map((s) => s.id));
+      const madeFrom = (l: Layer) => l.type === 'cutout' && old.has(l.params.selection as string);
+      for (const id of old) if (usersOf(project.layers.filter((l) => !madeFrom(l)), id).length) old.delete(id);
+      const kept = project.selections.filter((s) => !old.has(s.id));
+      const group = uid();
+      const sels = pieces.map(
+        (pc, i): Selection => ({ id: uid(), name: pc.name, color: SELECTION_COLORS[(kept.length + i) % SELECTION_COLORS.length], paint: encode(pc.mask), group }),
+      );
+      // largest piece at the bottom, small ones on top; each stays put until dragged
+      const layers = splitLayers ? sels.map((s) => makeLayer('cutout', { selection: s.id, dy: 0, shadow: 0, float: 0, spin: 0 })) : [];
+      setDoc((d) => ({
+        selections: [...d.selections.filter((s) => !old.has(s.id)), ...sels],
+        layers: [...d.layers.filter((l) => !(l.type === 'cutout' && old.has(l.params.selection as string))), ...layers],
+      }));
+      old.forEach((id) => setTrack(id, null));
+      if (selId && old.has(selId)) activateSel(null);
+      if (layerId && project.layers.some((l) => l.id === layerId && madeFrom(l))) selectLayer(null);
+      setShowSelections(true);
+      setToast(
+        splitLayers
+          ? `${sels.length}조각으로 나눴어요 · 효과 탭에서 조각을 끌면 옮겨져요`
+          : `${sels.length}조각으로 나눴어요 · 조각마다 효과를 넣거나 오려 띄워보세요`,
+      );
+    } catch (err) {
+      setToast(`자동 누끼를 못 했어요: ${(err as Error).message}`);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const exportPsd = async () => {
+    if (!project.selections.length) return;
+    setBusy('PSD 만드는 중…');
+    try {
+      // the latest auto split if there is one, otherwise every selection
+      const latest = project.selections.filter((s) => s.group).at(-1)?.group;
+      const n = await exportLayersPsd(project, latest ? project.selections.filter((s) => s.group === latest) : project.selections);
+      setToast(`레이어 ${n}개짜리 PSD를 받았어요 · 포토샵·포토피아·프로크리에이트에서 열려요`);
+    } catch (err) {
+      setToast(`PSD를 만들지 못했어요: ${(err as Error).message}`);
+    } finally {
+      setBusy('');
+    }
+  };
+
   const refineSel = async (op: RefineOp) => {
     if (!activeSel) return;
     const { w, h } = maskSize(fmt);
@@ -825,6 +883,12 @@ export default function App() {
               const s = project.selections.find((x) => x.id === id);
               if (s) flowSel(s);
             }}
+            splitDetail={splitDetail}
+            splitLayers={splitLayers}
+            onSplitDetail={setSplitDetail}
+            onSplitLayers={setSplitLayers}
+            onAutoSplit={() => void runAutoSplit()}
+            onExportPsd={() => void exportPsd()}
             onDelete={deleteSel}
           />
         )}
@@ -853,6 +917,8 @@ export default function App() {
           onCrop={(crop) => update((p) => ({ ...p, crop }))}
           onPick={(x, y, mods) => void onPick(x, y, mods)}
           onMarquee={(shape, mods) => void onMarquee(shape, mods)}
+          onLayerPick={selectLayer}
+          onLayerMove={(id, dx, dy, drag) => setLayers((ls) => ls.map((l) => (l.id === id ? { ...l, params: { ...l.params, dx, dy } } : l)), `${id}:move:${drag}`)}
           onLayerPaint={(url) => layer && patchLayer(layer.id, { mask: { ...layer.mask!, paint: url } })}
           onSelectionPaint={(id, url) => patchSel(id, { paint: url })}
           onNewBlankSelection={(url) => {

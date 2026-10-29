@@ -166,6 +166,8 @@ export interface Selection {
   paint: string;
   /** set after tracking through a video: the per-frame masks live in engine/track.ts */
   track?: SelectionTrack;
+  /** pieces from the same auto split share this id; the next split replaces them */
+  group?: string;
 }
 
 export interface SelectionTrack {

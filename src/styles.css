@@ -2626,13 +2626,15 @@ body {
   top: 0;
   z-index: 3;
   display: flex;
-  gap: 18px;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   padding: 18px 20px 14px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
 }
 .tool-tab {
   padding: 0;
+  white-space: nowrap;
   font-size: 12.8px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -3293,4 +3295,7 @@ button.drop-box:hover {
   background: #fff;
   outline: 1px solid #fff;
   outline-offset: 2px;
+}
+.frame.moving {
+  cursor: move;
 }
