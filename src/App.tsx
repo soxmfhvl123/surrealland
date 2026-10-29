@@ -496,9 +496,18 @@ export default function App() {
   const runAutoSplit = async () => {
     const base = baseFrame(project);
     if (!base) return;
-    setBusy('자동 누끼 준비 중… 처음엔 모델을 받느라 몇 초 걸려요');
+    setBusy('자동 누끼 준비 중…');
     try {
-      const pieces = await autoSplit(base, splitDetail, (done, total) => setBusy(`자동 누끼 따는 중… ${Math.round((done / total) * 100)}%`));
+      const pct = (f: number) => `${Math.round(f * 100)}%`;
+      const pieces = await autoSplit(base, baseFrame(project, 1024)!, splitDetail, (stage, f) =>
+        setBusy(
+          stage === 'model'
+            ? `누끼 모델 받는 중… ${pct(f)} (처음 한 번만, 약 80MB)`
+            : stage === 'look'
+              ? '사진 살펴보는 중…'
+              : `자동 누끼 따는 중… ${pct(f)}`,
+        ),
+      );
       if (!pieces.length) return setToast('나눌 물체를 찾지 못했어요');
       // the last run's pieces and the layers made from them give way, unless another effect uses a piece
       const old = new Set(project.selections.filter((s) => s.group).map((s) => s.id));

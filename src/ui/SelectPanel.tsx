@@ -74,7 +74,7 @@ export function SelectPanel(p: Props) {
 
       <div className="block">
         <div className="block-title">자동 누끼</div>
-        <p className="hint">버튼 한 번이면 사진 속 물체를 전부 찾아 조각조각 누끼를 따요. 조각은 선택으로 저장되고, 켜두면 조각마다 레이어가 생겨 캔버스에서 끌어 옮길 수 있어요.</p>
+        <p className="hint">버튼 한 번이면 사진 속 물체를 전부 찾아 윤곽대로 조각조각 누끼를 따요. 조각은 선택으로 저장되고, 켜두면 조각마다 레이어가 생겨 캔버스에서 끌어 옮길 수 있어요. 처음 한 번은 누끼 모델(약 80MB)을 받아요.</p>
         <Seg
           value={p.splitDetail}
           onChange={p.onSplitDetail}

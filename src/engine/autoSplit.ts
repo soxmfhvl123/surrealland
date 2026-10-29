@@ -1,24 +1,39 @@
 import { blankMask } from './masks';
-import { objectProber } from './select';
+import { SAM_MASK, samSession, loadSam } from './sam';
 
 /**
  * Auto split ("자동 누끼"): cut the whole photo into objects at once.
  *
- * A grid of points is probed with the magic touch model, the way SAM's automatic mask
- * generator does it. Masks that are the same region seen from another point are merged, then
- * the survivors are turned into a partition: every pixel goes to the smallest object that
- * claims it, so a person standing on a cliff is carved out of the cliff instead of being
- * counted twice. What nothing claims (often the sky, where the model is unsure) becomes a
- * piece of its own when it's big, or joins its neighbour when it's a sliver.
+ * SAM 2.1 looks at the photo once, then a grid of points is prompted the way SAM's automatic
+ * mask generator does it; each point gives three masks (part / object / whole) with the
+ * model's own quality score. Low-scoring or unstable masks are dropped and the same region found
+ * from another point is merged. Big surfaces (a wall, a road) often score low, so the regions
+ * nothing has claimed yet are prompted again from their middle. Every kept mask is snapped to
+ * the photo's edges with a guided filter. The survivors become a partition: every pixel goes to the smallest object
+ * that claims it, so a sign on a building is carved out of the building instead of being
+ * counted twice. What nothing claims becomes a piece of its own when it's big, or joins its
+ * neighbour when it's a sliver.
  */
 
 export type SplitDetail = 'low' | 'mid' | 'high';
 
-const LEVELS: Record<SplitDetail, { cols: number; minArea: number; max: number }> = {
-  low: { cols: 6, minArea: 0.015, max: 8 },
-  mid: { cols: 10, minArea: 0.006, max: 16 },
-  high: { cols: 15, minArea: 0.0025, max: 30 },
+interface Level {
+  cols: number;
+  minArea: number;
+  max: number;
+  /** which of the three masks per point: the largest good one, the best scored, or all good ones */
+  pick: 'big' | 'best' | 'all';
+  /** don't prompt inside an object smaller than this that was already found */
+  skipBelow: number;
+}
+
+const LEVELS: Record<SplitDetail, Level> = {
+  low: { cols: 8, minArea: 0.01, max: 10, pick: 'big', skipBelow: 0.25 },
+  mid: { cols: 12, minArea: 0.004, max: 24, pick: 'best', skipBelow: 0.12 },
+  high: { cols: 17, minArea: 0.0015, max: 48, pick: 'all', skipBelow: 0.02 },
 };
+
+export type SplitStage = 'model' | 'look' | 'split';
 
 export interface SplitPiece {
   /** white, with the piece in alpha (mask resolution) */
@@ -29,94 +44,185 @@ export interface SplitPiece {
 }
 
 interface Cand {
-  /** soft membership 0..255 at full mask resolution */
-  alpha: Uint8Array;
-  /** hard membership on a 1/LO grid, for cheap overlap tests */
+  /** the model's 256² logits for this mask */
+  logits: Float32Array;
+  /** soft membership 0..255 at full mask resolution (plain upsample, then edge-snapped at the end) */
+  alpha?: Uint8Array;
+  /** hard membership on the model's 64×64 grid, for cheap overlap tests */
   lo: Uint8Array;
   loArea: number;
   area: number;
+  score: number;
 }
 
-const LO = 4;
+const LO = 64;
 const ramp = (v: number, a: number, b: number) => Math.max(0, Math.min(1, (v - a) / (b - a)));
 
-export async function autoSplit(base: HTMLCanvasElement, detail: SplitDetail, onProgress?: (done: number, total: number) => void): Promise<SplitPiece[]> {
-  const { cols, minArea, max } = LEVELS[detail];
+/**
+ * `base` is the frame at mask resolution (the pieces come out at that size); `look` is the same
+ * frame larger, for the model to see detail (it works at 1024px).
+ */
+export async function autoSplit(
+  base: HTMLCanvasElement,
+  look: HTMLCanvasElement,
+  detail: SplitDetail,
+  onProgress?: (stage: SplitStage, frac: number) => void,
+): Promise<SplitPiece[]> {
+  const { cols, minArea, max, pick, skipBelow } = LEVELS[detail];
   const W = base.width;
   const H = base.height;
   const N = W * H;
   const rows = Math.max(2, Math.round((cols * H) / W));
-  const lw = Math.ceil(W / LO);
-  const lh = Math.ceil(H / LO);
-  const probe = await objectProber();
+  await loadSam((f) => onProgress?.('model', f));
+  onProgress?.('look', 0);
+  const sam = await samSession(look);
+  const guide = edgeGuide(base);
   const cands: Cand[] = [];
+  const M = SAM_MASK;
 
-  const consider = (conf: Float32Array) => {
-    let area = 0;
-    let loose = 0;
-    let tight = 0;
-    for (let i = 0; i < N; i++) {
-      const v = conf[i];
-      if (v > 0.5) area++;
-      if (v > 0.35) loose++;
-      if (v > 0.65) tight++;
-    }
-    const frac = area / N;
-    // specks, the whole frame, or a mushy mask whose edge moves with the threshold (SAM's
-    // stability score: real objects sit around 0.95, sky and haze around 0.65)
-    if (frac < minArea * 0.6 || frac > 0.9 || tight < loose * 0.8) return;
-    const lo = new Uint8Array(lw * lh);
+  const consider = (logits: Float32Array, off: number, score: number) => {
+    const lo = new Uint8Array(LO * LO);
     let loArea = 0;
-    for (let y = 0; y < lh; y++) {
-      for (let x = 0; x < lw; x++) {
-        if (conf[Math.min(H - 1, y * LO + 2) * W + Math.min(W - 1, x * LO + 2)] > 0.5) {
-          lo[y * lw + x] = 1;
+    const step = M / LO;
+    for (let y = 0; y < LO; y++) {
+      for (let x = 0; x < LO; x++) {
+        if (logits[off + (y * step + 2) * M + x * step + 2] > 0) {
+          lo[y * LO + x] = 1;
           loArea++;
         }
       }
     }
-    if (!loArea) return;
-    const make = (): Cand => {
-      const alpha = new Uint8Array(N);
-      for (let i = 0; i < N; i++) alpha[i] = Math.round(ramp(conf[i], 0.35, 0.65) * 255);
-      return { alpha, lo, loArea, area: frac };
-    };
-    // the same region seen from another point (or most of it): keep the fuller mask
+    const area = loArea / (LO * LO);
+    // the same region seen from another point (or nearly all of it): keep the better scored
     for (let j = 0; j < cands.length; j++) {
       const c = cands[j];
       let inter = 0;
       for (let i = 0; i < lo.length; i++) inter += lo[i] & c.lo[i];
       const small = Math.min(loArea, c.loArea);
       const big = Math.max(loArea, c.loArea);
-      if (inter / (loArea + c.loArea - inter) > 0.8 || (inter / small > 0.85 && small / big > 0.5)) {
-        if (loArea > c.loArea) cands[j] = make();
+      const same = inter / (loArea + c.loArea - inter) > (pick === 'all' ? 0.85 : 0.75) || (pick !== 'all' && inter / small > 0.9 && small / big > 0.6);
+      if (same) {
+        if (score > c.score) cands[j] = { logits: logits.slice(off, off + M * M), lo, loArea, area, score };
         return;
       }
     }
-    cands.push(make());
+    cands.push({ logits: logits.slice(off, off + M * M), lo, loArea, area, score });
+  };
+
+  // logits (256², squashed over the frame) → soft alpha at W×H, optionally snapped to the photo's edges
+  const toAlpha = (logits: Float32Array, snap: boolean) => {
+    const p = new Float32Array(N);
+    for (let y = 0; y < H; y++) {
+      const v = Math.min(M - 1.001, Math.max(0, ((y + 0.5) / H) * M - 0.5));
+      const y0 = Math.floor(v);
+      const fy = v - y0;
+      for (let x = 0; x < W; x++) {
+        const u = Math.min(M - 1.001, Math.max(0, ((x + 0.5) / W) * M - 0.5));
+        const x0 = Math.floor(u);
+        const fx = u - x0;
+        const i = y0 * M + x0;
+        const l = (logits[i] * (1 - fx) + logits[i + 1] * fx) * (1 - fy) + (logits[i + M] * (1 - fx) + logits[i + M + 1] * fx) * fy;
+        p[y * W + x] = ramp(l, -2, 2);
+      }
+    }
+    const q = snap ? guide(p) : p;
+    const alpha = new Uint8Array(N);
+    for (let i = 0; i < N; i++) alpha[i] = Math.round(ramp(q[i], 0.1, 0.9) * 255);
+    return alpha;
   };
 
   const total = cols * rows;
-  for (let k = 0; k < total; k++) {
-    const x = ((k % cols) + 0.5) / cols;
-    const y = (Math.floor(k / cols) + 0.5) / rows;
-    // inside an object already found (not a big region like sky or ground): nothing new here
-    const li = Math.min(lh - 1, Math.floor((y * H) / LO)) * lw + Math.min(lw - 1, Math.floor((x * W) / LO));
-    if (!cands.some((c) => c.lo[li] && c.area < 0.2)) {
-      const conf = probe(base, x, y);
-      if (conf) consider(conf);
+  try {
+    for (let k = 0; k < total; k++) {
+      const x = ((k % cols) + 0.5) / cols;
+      const y = (Math.floor(k / cols) + 0.5) / rows;
+      // inside a small object already found: nothing new to find here
+      const li = Math.min(LO - 1, Math.floor(y * LO)) * LO + Math.min(LO - 1, Math.floor(x * LO));
+      if (!cands.some((c) => c.lo[li] && c.area < skipBelow)) {
+        const out = await sam.decode(x, y);
+        if (out.objectness > 0) {
+          const good: { m: number; area: number; score: number }[] = [];
+          for (let m = 0; m < 3; m++) {
+            const off = m * M * M;
+            let pos = 0;
+            let loose = 0;
+            let tight = 0;
+            for (let i = off; i < off + M * M; i++) {
+              const v = out.logits[i];
+              if (v > 0) pos++;
+              if (v > -1) loose++;
+              if (v > 1) tight++;
+            }
+            const area = pos / (M * M);
+            // SAM's filters: its own IoU guess, and a stable edge (the mask barely moves with the threshold)
+            const stable = loose ? tight / loose : 0;
+            if (out.iou[m] < 0.65 || stable < 0.8 || area < minArea * 0.6 || area > 0.95) continue;
+            good.push({ m, area, score: out.iou[m] * stable });
+          }
+          const chosen =
+            pick === 'all' ? good : pick === 'big' ? good.sort((a, b) => b.area - a.area).slice(0, 1) : good.sort((a, b) => b.score - a.score).slice(0, 1);
+          for (const g of chosen) consider(out.logits, g.m * M * M, g.score);
+        }
+      }
+      if (k % 4 === 3 || k === total - 1) {
+        onProgress?.('split', ((k + 1) / total) * 0.85);
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
-    if (k % 4 === 3 || k === total - 1) {
-      onProgress?.(k + 1, total);
-      await new Promise((r) => setTimeout(r, 0));
+
+    // fill the gaps: prompt the deepest point of the biggest region nothing has claimed yet and
+    // take the mask that covers most of it while staying mostly inside it
+    const tried = new Uint8Array(LO * LO);
+    for (let round = 0; round < 24; round++) {
+      const free = new Uint8Array(LO * LO);
+      for (let i = 0; i < LO * LO; i++) free[i] = tried[i] || cands.some((c) => c.lo[i]) ? 0 : 1;
+      const { label, sizes } = components((i) => free[i] === 1, LO, LO);
+      let gap = -1;
+      sizes.forEach((n, c) => (gap < 0 || n > sizes[gap] ? (gap = c) : 0));
+      if (gap < 0 || sizes[gap] < minArea * LO * LO) break;
+      const at = deepest(label, gap, LO);
+      const out = await sam.decode(((at % LO) + 0.5) / LO, (Math.floor(at / LO) + 0.5) / LO);
+      let pickM = -1;
+      let gain = 0;
+      for (let m = 0; m < 3 && out.objectness > 0; m++) {
+        const off = m * M * M;
+        const step = M / LO;
+        let area = 0;
+        let fresh = 0;
+        let inGap = 0;
+        for (let i = 0; i < LO * LO; i++) {
+          if (out.logits[off + (Math.floor(i / LO) * step + 2) * M + (i % LO) * step + 2] <= 0) continue;
+          area++;
+          if (free[i]) fresh++;
+          if (label[i] === gap) inGap++;
+        }
+        if (out.iou[m] < 0.3 || area < minArea * LO * LO * 0.6 || fresh < area * 0.6 || inGap <= gain) continue;
+        pickM = m;
+        gain = inGap;
+      }
+      if (pickM >= 0) consider(out.logits, pickM * M * M, out.iou[pickM]);
+      // never prompt the same spot twice
+      for (let dy = -3; dy <= 3; dy++) {
+        for (let dx = -3; dx <= 3; dx++) {
+          const x = (at % LO) + dx;
+          const y = Math.floor(at / LO) + dy;
+          if (x >= 0 && y >= 0 && x < LO && y < LO) tried[y * LO + x] = 1;
+        }
+      }
+      onProgress?.('split', 0.85 + (round / 24) * 0.15);
     }
+  } finally {
+    sam.release();
   }
 
-  // partition, smallest first; drop pieces left too small (or past the cap) and redo
+  // partition, smallest first; drop pieces left too small (or past the cap) and redo. The
+  // passes work on plain upsampled masks; the final one on edge-snapped masks.
   let list = cands;
   let parts: { cand: Cand; alpha: Uint8Array; area: number }[] = [];
   let rest = new Uint8Array(N);
-  for (let pass = 0; pass < 4; pass++) {
+  for (let pass = 0, last = false; pass < 6; pass++) {
+    if (last) for (const c of list) c.alpha = toAlpha(c.logits, true);
+    else for (const c of list) c.alpha ??= toAlpha(c.logits, false);
     const order = [...list].sort((a, b) => a.area - b.area);
     const out = order.map(() => new Uint8Array(N));
     const sums = order.map(() => 0);
@@ -124,7 +230,7 @@ export async function autoSplit(base: HTMLCanvasElement, detail: SplitDetail, on
     for (let i = 0; i < N; i++) {
       let r = 255;
       for (let k = 0; k < order.length && r; k++) {
-        const a = Math.min(order[k].alpha[i], r);
+        const a = Math.min(order[k].alpha![i], r);
         if (a) {
           out[k][i] = a;
           sums[k] += a;
@@ -134,11 +240,12 @@ export async function autoSplit(base: HTMLCanvasElement, detail: SplitDetail, on
       rest[i] = r;
     }
     parts = order.map((cand, k) => ({ cand, alpha: out[k], area: sums[k] / 255 / N }));
+    if (last) break;
     const keep = parts
       .filter((pt) => pt.area >= minArea)
       .sort((a, b) => b.area - a.area)
       .slice(0, max);
-    if (keep.length === parts.length) break;
+    if (keep.length === parts.length || pass >= 3) last = true;
     list = keep.map((pt) => pt.cand);
   }
 
@@ -155,6 +262,88 @@ export async function autoSplit(base: HTMLCanvasElement, detail: SplitDetail, on
   let n = 0;
   for (const pc of pieces) pc.name = pc === sky ? '하늘' : `누끼 ${++n}`;
   return pieces.map((pc) => ({ mask: toMask(pc.alpha, W, H), name: pc.name, area: pc.area }));
+}
+
+/** The cell of component `id` farthest from its edge (city-block distance transform). */
+function deepest(label: Int32Array, id: number, n: number) {
+  const d = new Int32Array(n * n);
+  for (let i = 0; i < n * n; i++) d[i] = label[i] === id ? n * n : 0;
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const i = y * n + x;
+      if (!d[i]) continue;
+      d[i] = Math.min(d[i], (x ? d[i - 1] : 0) + 1, (y ? d[i - n] : 0) + 1);
+    }
+  }
+  let best = 0;
+  for (let y = n - 1; y >= 0; y--) {
+    for (let x = n - 1; x >= 0; x--) {
+      const i = y * n + x;
+      if (!d[i]) continue;
+      d[i] = Math.min(d[i], (x < n - 1 ? d[i + 1] : 0) + 1, (y < n - 1 ? d[i + n] : 0) + 1);
+      if (d[i] > d[best]) best = i;
+    }
+  }
+  return best;
+}
+
+/** Box mean over a (2r+1)² window, via an integral image. */
+function boxMean(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  const ii = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) {
+      row += src[y * w + x];
+      ii[(y + 1) * (w + 1) + x + 1] = ii[y * (w + 1) + x + 1] + row;
+    }
+  }
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w, x + r + 1);
+      const s = ii[y1 * (w + 1) + x1] - ii[y0 * (w + 1) + x1] - ii[y1 * (w + 1) + x0] + ii[y0 * (w + 1) + x0];
+      out[y * w + x] = s / ((y1 - y0) * (x1 - x0));
+    }
+  }
+  return out;
+}
+
+/**
+ * Guided filter (He et al.) with the photo's brightness as the guide: a soft mask comes back
+ * with its edge pulled onto the edges in the photo. The guide's statistics are computed once.
+ */
+function edgeGuide(base: HTMLCanvasElement, r = 3, eps = 0.002) {
+  const w = base.width;
+  const h = base.height;
+  const d = base.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, w, h).data;
+  const I = new Float32Array(w * h);
+  const II = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    I[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    II[i] = I[i] * I[i];
+  }
+  const mI = boxMean(I, w, h, r);
+  const mII = boxMean(II, w, h, r);
+  return (p: Float32Array) => {
+    const Ip = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) Ip[i] = I[i] * p[i];
+    const mp = boxMean(p, w, h, r);
+    const mIp = boxMean(Ip, w, h, r);
+    const a = new Float32Array(w * h);
+    const b = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      a[i] = (mIp[i] - mI[i] * mp[i]) / (mII[i] - mI[i] * mI[i] + eps);
+      b[i] = mp[i] - a[i] * mI[i];
+    }
+    const ma = boxMean(a, w, h, r);
+    const mb = boxMean(b, w, h, r);
+    const q = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) q[i] = ma[i] * I[i] + mb[i];
+    return q;
+  };
 }
 
 function sum(a: Uint8Array) {
