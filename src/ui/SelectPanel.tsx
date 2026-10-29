@@ -2,7 +2,7 @@ import { Brush, Cloud, MousePointerClick, Moon, Pipette, Plus, Scissors, Sparkle
 import type { Layer, Selection } from '../engine/types';
 import { PanelHeader, Seg, Slider, Toggle } from './kit';
 
-export type SelectMode = 'click' | 'brush' | 'rect' | 'ellipse' | 'color';
+export type SelectMode = 'click' | 'brush' | 'rect' | 'ellipse' | 'lasso' | 'color';
 export type QuickSelect = 'sky' | 'person' | 'bright' | 'dark' | 'empty';
 
 interface Props {
@@ -30,6 +30,7 @@ const HINT: Record<SelectMode, string> = {
   brush: '드래그해서 지금 선택을 칠해요. Option(Alt)을 누르고 드래그하면 지워져요.',
   rect: '드래그해서 네모로 선택해요. Shift+드래그는 지금 선택에 더하기, Option(Alt)+드래그는 빼기예요.',
   ellipse: '드래그해서 원(타원)으로 선택해요. Shift+드래그는 더하기, Option(Alt)+드래그는 빼기예요.',
+  lasso: '클릭할 때마다 점이 찍혀 모양이 그려져요. 첫 점을 다시 누르거나 더블클릭·Enter로 닫으면 선택돼요. 누른 채 드래그하면 자유롭게 그려져요. ⌫는 한 점 되돌리기, Esc는 취소. 첫 점을 Shift로 찍으면 더하기, Option(Alt)이면 빼기예요.',
   color: '사진에서 색을 클릭하면 비슷한 색이 모두 선택돼요. Shift+클릭은 더하기.',
 };
 
@@ -55,6 +56,7 @@ export function SelectPanel(p: Props) {
             { value: 'brush', label: <><Brush size={14} /> 브러시</> },
             { value: 'rect', label: '네모' },
             { value: 'ellipse', label: '원' },
+            { value: 'lasso', label: '라쏘' },
             { value: 'color', label: <><Pipette size={14} /> 색</> },
           ]}
         />

@@ -14,6 +14,17 @@ export interface PickMods {
   subtract: boolean;
 }
 
+export interface Pt {
+  x: number;
+  y: number;
+}
+
+/** A shape drawn in the select tool, in normalized frame coords. */
+export type MarqueeShape = { kind: 'rect' | 'ellipse'; rect: Rect } | { kind: 'lasso'; points: Pt[] };
+
+/** A lasso point; knots are the clicked corners, the rest come from freehand drags. */
+type LassoPt = Pt & { knot?: boolean };
+
 interface Props {
   project: Project;
   time: number;
@@ -35,8 +46,8 @@ interface Props {
   onRectChange: (key: string, r: Rect) => void;
   onCrop: (c: Crop) => void;
   onPick: (x: number, y: number, mods: PickMods) => void;
-  /** a rectangle or ellipse dragged out in the select tool (normalized frame coords) */
-  onMarquee: (r: Rect, shape: 'rect' | 'ellipse', mods: PickMods) => void;
+  /** a box, ellipse or lasso drawn in the select tool */
+  onMarquee: (shape: MarqueeShape, mods: PickMods) => void;
   /** a finished brush stroke on the layer's own painted mask */
   onLayerPaint: (url: string) => void;
   /** brush on the active selection; creates one first if there is none */
@@ -55,6 +66,20 @@ interface Props {
 type Mode = 'move' | 'nw' | 'ne' | 'sw' | 'se';
 const MIN = 0.02;
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+const clampPt = (q: Pt): Pt => ({ x: clamp01(q.x), y: clamp01(q.y) });
+/** a click this close (in screen px) to the first lasso point closes the shape */
+const CLOSE_PX = 9;
+
+/** Area of a polygon in normalized units (shoelace). */
+function polyArea(pts: Pt[]) {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    const q = pts[(i + 1) % pts.length];
+    a += p.x * q.y - q.x * p.y;
+  }
+  return Math.abs(a) / 2;
+}
 
 function applyDrag(r: Rect, mode: Mode, dx: number, dy: number, lockRatio: number | null): Rect {
   let { x, y, w, h } = r;
@@ -145,8 +170,12 @@ export function Stage(p: Props) {
   const layerBrush = !selecting && !!layer && layer.mask?.shape === 'paint';
   const brushing = selBrush || layerBrush;
   const marqueeMode = selecting && (selectMode === 'rect' || selectMode === 'ellipse');
+  const lassoMode = selecting && selectMode === 'lasso';
   const picking = selecting && (selectMode === 'click' || selectMode === 'color');
   const [marquee, setMarquee] = useState<Rect | null>(null);
+  const [lasso, setLasso] = useState<{ pts: LassoPt[]; mods: PickMods } | null>(null);
+  const lassoRef = useRef(lasso);
+  lassoRef.current = lasso;
   const erase = brush.erase !== alt;
 
   useEffect(() => onMasksChanged(() => setMaskTick((n) => n + 1)), []);
@@ -184,6 +213,34 @@ export function Stage(p: Props) {
       window.removeEventListener('blur', off);
     };
   }, []);
+
+  // leaving the lasso drops a shape that was never closed
+  useEffect(() => {
+    if (!lassoMode) setLasso(null);
+  }, [lassoMode]);
+
+  // while a lasso is open: Enter closes, Esc cancels, Backspace takes back the last point.
+  // Capture phase, so the app's own Esc/Backspace (deselect, delete) don't fire too.
+  const finishRef = useRef<(l: { pts: LassoPt[]; mods: PickMods }) => void>(() => {});
+  useEffect(() => {
+    if (!lasso) return;
+    const onKey = (e: KeyboardEvent) => {
+      const l = lassoRef.current;
+      if (!l) return;
+      if (e.key === 'Enter') finishRef.current(l);
+      else if (e.key === 'Escape') setLasso(null);
+      else if (e.key === 'Backspace' || e.key === 'Delete') {
+        // drop the freehand run back to the previous clicked corner, or the last corner itself
+        const pts = l.pts.slice(0, -1);
+        while (pts.length && !pts[pts.length - 1].knot) pts.pop();
+        setLasso(pts.length ? { ...l, pts } : null);
+      } else return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [!!lasso]);
 
   // overlay: selections in the select tool, a peeked selection, or the layer's painted mask
   useEffect(() => {
@@ -385,7 +442,61 @@ export function Stage(p: Props) {
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', up);
       setMarquee(null);
-      if (r.w > 0.01 && r.h > 0.01) p.onMarquee(round(r), shape, mods);
+      if (r.w > 0.01 && r.h > 0.01) p.onMarquee({ kind: shape, rect: round(r) }, mods);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  };
+
+  const nearFirst = (q: Pt, first: Pt) => {
+    const f = frameRef.current!.getBoundingClientRect();
+    return Math.hypot((q.x - first.x) * f.width, (q.y - first.y) * f.height) < CLOSE_PX;
+  };
+
+  const finishLasso = (l: { pts: LassoPt[]; mods: PickMods }) => {
+    setLasso(null);
+    const pts = l.pts.map((q) => ({ x: Math.round(q.x * 1e4) / 1e4, y: Math.round(q.y * 1e4) / 1e4 }));
+    if (pts.length >= 3 && polyArea(pts) > 2e-4) p.onMarquee({ kind: 'lasso', points: pts }, l.mods);
+  };
+  finishRef.current = finishLasso;
+
+  // lasso: each click drops a corner; holding and dragging draws freehand. A drag on an empty
+  // canvas closes on release; once corners exist, the shape closes on the first point, a
+  // double-click or Enter.
+  const startLasso = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const f = frameRef.current!.getBoundingClientRect();
+    const a = clampPt(toNorm(e));
+    const prev = lassoRef.current;
+    if (prev && prev.pts.length >= 3 && nearFirst(a, prev.pts[0])) return finishLasso(prev);
+    const mods = prev?.mods ?? { add: e.shiftKey, subtract: e.altKey };
+    const fresh = !prev;
+    const pointer = e.pointerId;
+    let pts: LassoPt[] = [...(prev?.pts ?? []), { ...a, knot: true }];
+    let dragged = false;
+    setLasso({ pts, mods });
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      const b = clampPt(toNorm(ev));
+      const last = pts[pts.length - 1];
+      const px = (q: Pt) => Math.hypot((b.x - q.x) * f.width, (b.y - q.y) * f.height);
+      if ((!dragged && px(a) < 5) || px(last) < 3) return;
+      dragged = true;
+      pts = [...pts, b];
+      setLasso({ pts, mods });
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointer) return;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      if (ev.type === 'pointercancel') return setLasso(null);
+      if (dragged) {
+        pts[pts.length - 1] = { ...pts[pts.length - 1], knot: true };
+        if (fresh) finishLasso({ pts, mods });
+        else setLasso({ pts, mods });
+      }
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -396,6 +507,10 @@ export function Stage(p: Props) {
     if (e.button !== 0 || !hasPhoto || compare) return;
     if (marqueeMode) {
       if (!p.busy) startMarquee(e);
+      return;
+    }
+    if (lassoMode) {
+      if (!p.busy) startLasso(e);
       return;
     }
     if (picking) {
@@ -409,7 +524,7 @@ export function Stage(p: Props) {
     if (tool === 'photo') startPan(e);
   };
 
-  const frameClass = ['frame', brushing ? 'brushing' : '', picking || marqueeMode ? (alt ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : ''].join(' ');
+  const frameClass = ['frame', brushing ? 'brushing' : '', picking || marqueeMode || lassoMode ? ((lasso ? lasso.mods.subtract : alt) ? 'picking sub' : 'picking') : '', tool === 'photo' && hasPhoto ? 'panning' : ''].join(' ');
 
   const hint = p.busy
     ? null
@@ -420,6 +535,10 @@ export function Stage(p: Props) {
           : '드래그해서 칠하기 · Option 누르고 드래그하면 지우기'
         : marqueeMode
           ? `드래그해서 ${selectMode === 'ellipse' ? '원' : '네모'}로 선택 · Shift+드래그 더하기 · Option+드래그 빼기`
+          : lassoMode
+            ? lasso
+              ? `점 ${lasso.pts.filter((q) => q.knot).length}개 · 첫 점 클릭·더블클릭·Enter로 닫기 · ⌫ 한 점 되돌리기 · Esc 취소`
+              : '점을 찍어 모양 그리기 · 누른 채 드래그하면 자유롭게 · Shift 더하기 · Option 빼기'
           : selectMode === 'color'
           ? '클릭한 색과 비슷한 곳을 선택 · Shift 더하기 · Option 빼기'
           : alt
@@ -446,8 +565,9 @@ export function Stage(p: Props) {
         ref={frameRef}
         style={{ width: box.w, height: box.h, visibility: box.w ? 'visible' : 'hidden' }}
         onPointerDown={onPointerDown}
-        onPointerMove={(e) => brushing && setCursor(toNorm(e))}
+        onPointerMove={(e) => (brushing || lassoMode) && setCursor(toNorm(e))}
         onPointerLeave={() => setCursor(null)}
+        onDoubleClick={() => lasso && finishLasso(lasso)}
       >
         <canvas ref={canvasRef} />
         <canvas ref={overlayRef} className="sel-overlay" />
@@ -463,6 +583,7 @@ export function Stage(p: Props) {
             style={{ left: `${marquee.x * 100}%`, top: `${marquee.y * 100}%`, width: `${marquee.w * 100}%`, height: `${marquee.h * 100}%` }}
           />
         )}
+        {lasso && <LassoOverlay pts={lasso.pts} cursor={cursor} sub={lasso.mods.subtract} closing={!!cursor && lasso.pts.length >= 3 && nearFirst(cursor, lasso.pts[0])} />}
         {!hasPhoto && (
           <div className="empty-frame">
             <button className="drop-box" onClick={p.onUpload}>
@@ -550,6 +671,27 @@ export function Stage(p: Props) {
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** The open lasso: its outline so far, a rubber band to the cursor, and square corner handles. */
+function LassoOverlay({ pts, cursor, sub, closing }: { pts: LassoPt[]; cursor: Pt | null; sub: boolean; closing: boolean }) {
+  const line = (cursor && !closing ? [...pts, cursor] : pts).map((q) => `${q.x},${q.y}`).join(' ');
+  const last = pts[pts.length - 1];
+  return (
+    <div className={`lasso ${sub ? 'sub' : ''}`}>
+      <svg viewBox="0 0 1 1" preserveAspectRatio="none">
+        <polygon points={line} className="lasso-fill" />
+        <polyline points={line} className="lasso-under" vectorEffect="non-scaling-stroke" />
+        <polyline points={line} className="lasso-line" vectorEffect="non-scaling-stroke" />
+        {closing && <line x1={last.x} y1={last.y} x2={pts[0].x} y2={pts[0].y} className="lasso-line" vectorEffect="non-scaling-stroke" />}
+      </svg>
+      {pts.map((q, i) =>
+        q.knot || i === 0 ? (
+          <i key={i} className={`lasso-knot ${i === 0 ? 'first' : ''} ${i === 0 && closing ? 'closing' : ''}`} style={{ left: `${q.x * 100}%`, top: `${q.y * 100}%` }} />
+        ) : null,
+      )}
     </div>
   );
 }

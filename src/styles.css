@@ -3241,3 +3241,56 @@ button.drop-box:hover {
 .marquee.sub {
   border-color: #ff8a95;
 }
+
+/* lasso: open outline, rubber band, square corners */
+.lasso {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.lasso svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.lasso-fill {
+  fill: rgba(255, 255, 255, 0.08);
+  stroke: none;
+}
+.lasso-under {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 3;
+  stroke-linejoin: round;
+}
+.lasso-line {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+.lasso.sub .lasso-line {
+  stroke: #ff8a95;
+}
+.lasso-knot {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  background: #fff;
+  border: 1px solid #000;
+}
+.lasso-knot.first {
+  width: 11px;
+  height: 11px;
+  margin: -5.5px 0 0 -5.5px;
+  background: #000;
+  border-color: #fff;
+}
+.lasso-knot.first.closing {
+  background: #fff;
+  outline: 1px solid #fff;
+  outline-offset: 2px;
+}
